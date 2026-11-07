@@ -62,6 +62,22 @@ In-channel commands (handled locally, never reach claude):
   `bypassPermissions`, `manual`, `dontAsk`, `plan`.
 - `/log [n]` — last `n` (default 10) log lines.
 
+## Which model answered
+
+Every turn logs `requested=<model> served=<model> models=<all used>` (see `/log`).
+`served` is the model of the last assistant message, i.e. the one that wrote the
+answer. When it differs from the requested one, or claude reports a switch
+(`system/model_fallback`, `model_refusal_fallback`, `model_consent_fallback`,
+e.g. after a safeguard refusal), the reply gets a footer:
+
+```
+⚠️ answered by claude-opus-4-8 (requested: claude-opus-5-5 → fallback)
+```
+
+No footer on a normal turn. `/model` also shows `Last turn answered by: …`, and the
+channel's `model` metadata is the served model. Several models in `modelUsage`
+alone don't count as a fallback (claude uses a small model internally, e.g. WebFetch).
+
 ## Permissions
 
 `claude -p` can't ask. Tool calls the mode doesn't allow are denied, claude is

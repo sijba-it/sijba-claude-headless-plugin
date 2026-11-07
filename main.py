@@ -374,6 +374,18 @@ def _model_list(models: list[dict], current: str) -> str:
     return "Available:\n" + "\n".join(lines)
 
 
+FALLBACK_SUBTYPES = ("model_fallback", "model_refusal_fallback", "model_consent_fallback")
+
+
+def _base_model(model_id: str) -> str:
+    """claude-opus-5-5[1m] / claude-opus-5-5-20261001 -> claude-opus-5-5 for comparing."""
+    return re.sub(r"(\[.*\]|-\d{8})$", "", model_id.strip().lower())
+
+
+def _first(event: dict, *keys: str) -> str:
+    return next((str(event[k]) for k in keys if event.get(k)), "")
+
+
 class ClaudeSession:
     """One sijba channel's ongoing Claude conversation.
 
@@ -387,6 +399,8 @@ class ClaudeSession:
         self.claude_session_id: str | None = None
         self.current_proc: asyncio.subprocess.Process | None = None
         self._killed = False
+        self.last_served: str | None = None   # model that wrote the last turn's answer
+        self.last_fallback: str | None = None
 
     async def start(self):
         _log("Claude session ready (print mode)")
@@ -440,13 +454,15 @@ class ClaudeSession:
             await proc.stdin.drain()
             proc.stdin.close()
             final_text = ""
-            model = "?"
+            model = "?"          # requested, as resolved by claude (init event)
+            served = ""          # model of the last assistant message = who wrote the answer
+            fallbacks: list[str] = []
             usage: dict = {}
             result: dict = {}
             stderr_buf = bytearray()
 
             async def _pump_stdout() -> None:
-                nonlocal final_text, model, usage, result
+                nonlocal final_text, model, served, usage, result
                 async for line in _iter_json_lines(proc.stdout):
                     try:
                         event = json.loads(line)
@@ -457,7 +473,16 @@ class ClaudeSession:
                         model = event.get("model", model)
                         if event.get("session_id"):
                             self.claude_session_id = event["session_id"]
-                    elif etype == "system" and event.get("subtype") == "informational" and event.get("content"):
+                    elif etype == "system" and event.get("subtype") in FALLBACK_SUBTYPES:
+                        # claude switched models mid-turn (safeguard refusal, overload, consent, ...)
+                        to = _first(event, "fallback_model", "fallbackModel", "to_model", "toModel")
+                        frm = _first(event, "original_model", "originalModel", "from_model", "fromModel")
+                        fallbacks.append(f"{event['subtype']}: {frm or '?'} → {to or '?'}")
+                        if event.get("content") and on_chunk:
+                            await on_chunk(f"\n⚠️ {event['content']}\n")
+                    elif etype == "system" and event.get("content") and (
+                            event.get("subtype") in ("informational", "model_refusal_no_fallback")
+                            or event.get("level") in ("warning", "error")):
                         # e.g. "safeguards stopped the response above · continuing once ..."
                         if on_chunk:
                             await on_chunk(f"\n⚠️ {event['content']}\n")
@@ -468,6 +493,7 @@ class ClaudeSession:
                             if delta.get("text") and on_chunk:
                                 await on_chunk(_truncate(delta["text"]))
                     elif etype == "assistant":
+                        served = (event.get("message") or {}).get("model") or served
                         for block in (event.get("message") or {}).get("content") or []:
                             if block.get("type") == "tool_use" and on_chunk:
                                 await on_chunk(f"\n_[{_describe_tool_call(block.get('name', 'tool'), block.get('input') or {})}]_\n")
@@ -492,8 +518,17 @@ class ClaudeSession:
             if stderr_text:
                 _log(f"stderr: {stderr_text}")
             context = sum(usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            used = list((result.get("modelUsage") or {}).keys())
+            # A fallback is the answer coming from another model than the requested
+            # one, or claude saying it switched. More than one model in modelUsage
+            # alone is not: claude uses a small model internally (e.g. WebFetch).
+            fallback = bool(fallbacks) or bool(served and model != "?" and _base_model(served) != _base_model(model))
+            self.last_served = served or None
+            self.last_fallback = (fallbacks[-1] if fallbacks else f"{model} → {served}") if fallback else None
             _log(
-                f"usage model={model} mode={mode} context={_fmt_tokens(context)} "
+                f"usage requested={model} served={served or '?'} models={','.join(used) or '?'}"
+                f"{' FALLBACK ' + '; '.join(fallbacks or [f'{model} → {served}']) if fallback else ''} "
+                f"mode={mode} context={_fmt_tokens(context)} "
                 f"cached={_fmt_tokens(usage.get('cache_read_input_tokens', 0))} out={_fmt_tokens(usage.get('output_tokens', 0))} "
                 f"cost=${result.get('total_cost_usd', 0):.4f}"
             )
@@ -520,7 +555,10 @@ class ClaudeSession:
                 _log(f"{len(denials)} permission denial(s) in mode {mode}")
                 final_text = f"{final_text}\n\n{_describe_denials(denials, mode)}".strip()
 
-            return {"text": final_text or "(no output)", "request_id": request_id, "model": model,
+            if fallback:
+                final_text = (f"{final_text or '(no output)'}\n\n⚠️ answered by {served or '?'} "
+                              f"(requested: {current_model() or model} → fallback)")
+            return {"text": final_text or "(no output)", "request_id": request_id, "model": served or model,
                     "usage": usage, "context_tokens": context}
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
@@ -700,6 +738,10 @@ class PluginClient:
                 else:
                     source = "claude's own default"
                 reply = f"Current model: {current_model() or 'default'} — {source}"
+                if self.session.last_served:
+                    reply += f"\nLast turn answered by: {self.session.last_served}"
+                    if self.session.last_fallback:
+                        reply += f" ⚠️ fallback ({self.session.last_fallback})"
                 reply += "\n\n" + (_model_list(models, current_model()) if models else "(model list unavailable right now)")
                 reply += "\n\nSet with /model <name> (e.g. /model sonnet), list with a pattern (/model claude-opus*), back with /model default."
             elif arg.lower() == "default":
@@ -735,7 +777,8 @@ class PluginClient:
                         reply += " Couldn't check it against the model list — if the next turn fails, it doesn't exist."
                     _log(f"model changed to {cfg['model']!r} via /model")
                 else:
-                    reply = f"Unknown model {arg!r}.\n\n{_model_list(models, current_model())}"
+                    reply = (f"Unknown model {arg!r} — use a name from the list, e.g. the alias `opus` "
+                             f"or a full id like `claude-opus-4-8`.\n\n{_model_list(models, current_model())}")
             self._remember_reply(envelope_id, reply)
             await self._reply(channel_id, envelope_id, reply)
             return True
