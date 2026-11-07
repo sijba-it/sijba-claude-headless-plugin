@@ -53,7 +53,7 @@ In-channel commands (handled locally, never reach claude):
 - `/reset` — forget the session id; the next turn starts a fresh conversation.
 - `/kill` — abort the running turn (incl. the shell commands claude started), then reset.
   Handled immediately, not queued behind the running turn.
-- `/model [name]` — show / set the model for this project (`WORK_DIR/.claude-headless.json`).
+- `/model [name]` — without a name: current model + the models this account can use (asked from claude itself, no cost). With a name: set it for this project (`WORK_DIR/.claude-headless.json`); only listed models are accepted, `/model default` goes back to the default.
 - `/mode [name]` — show / set the permission mode: `acceptEdits`, `auto`,
   `bypassPermissions`, `manual`, `dontAsk`, `plan`.
 - `/log [n]` — last `n` (default 10) log lines.

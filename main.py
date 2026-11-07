@@ -319,6 +319,60 @@ def _kill_tree(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
+_MODEL_CACHE: tuple[float, list[dict]] | None = None
+
+
+async def available_models() -> list[dict] | None:
+    """The models this account can use, as claude itself reports them on an
+    SDK `initialize` control request (value / displayName / description) — no
+    prompt is sent, so it costs nothing. Cached for an hour; None if unknown."""
+    global _MODEL_CACHE
+    if _MODEL_CACHE and time.monotonic() - _MODEL_CACHE[0] < 3600:
+        return _MODEL_CACHE[1]
+    proc = None
+    models = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            CLAUDE_CMD, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            cwd=WORK_DIR, env=_agent_env(), start_new_session=True,
+        )
+        proc.stdin.write((json.dumps({"type": "control_request", "request_id": "models",
+                                      "request": {"subtype": "initialize"}}) + "\n").encode())
+        await proc.stdin.drain()
+
+        async def _read() -> list[dict] | None:
+            async for line in _iter_json_lines(proc.stdout):
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if event.get("type") == "control_response":
+                    return ((event.get("response") or {}).get("response") or {}).get("models")
+            return None
+
+        models = await asyncio.wait_for(_read(), timeout=30)
+    except (asyncio.TimeoutError, OSError) as exc:
+        _log(f"model list unavailable: {exc!r}")
+    finally:
+        if proc and proc.returncode is None:
+            _kill_tree(proc)
+            await proc.wait()
+    if models:
+        _MODEL_CACHE = (time.monotonic(), models)
+    return models or None
+
+
+def _model_list(models: list[dict], current: str) -> str:
+    lines = []
+    for m in models:
+        value = m.get("value", "")
+        mark = " ←" if value == (current or "default") else ""
+        desc = " · ".join(x for x in (m.get("displayName"), m.get("description")) if x)
+        lines.append(f"  {value} — {desc}{mark}")
+    return "Available:\n" + "\n".join(lines)
+
+
 class ClaudeSession:
     """One sijba channel's ongoing Claude conversation.
 
@@ -634,22 +688,37 @@ class PluginClient:
             return True
 
         if cmd == "model":
-            new_model = rest.strip()
-            if not new_model:
-                cfg_model = _load_config().get("model")
-                if cfg_model:
+            arg = rest.strip()
+            models = await available_models()
+            cfg = _load_config()
+            if not arg:
+                if cfg.get("model"):
                     source = f"set for this project ({CONFIG_PATH.name})"
                 elif DEFAULT_MODEL:
                     source = f"catalog default (CLAUDE_MODEL={DEFAULT_MODEL})"
                 else:
-                    source = "claude's own default (no override set)"
-                reply = f"Current model: {current_model() or '(claude default)'} — {source}"
-            else:
-                cfg = _load_config()
-                cfg["model"] = new_model
+                    source = "claude's own default"
+                reply = f"Current model: {current_model() or 'default'} — {source}"
+                reply += "\n\n" + (_model_list(models, current_model()) if models else "(model list unavailable right now)")
+                reply += "\n\nSet with /model <name>, e.g. /model sonnet — back with /model default."
+            elif arg.lower() == "default":
+                cfg.pop("model", None)
                 _save_config(cfg)
-                reply = f"Model for {PROJECT_NAME} set to {new_model} (next turn uses it)."
-                _log(f"model changed to {new_model!r} via /model")
+                fallback = DEFAULT_MODEL or "claude's own default"
+                reply = f"Model for {PROJECT_NAME} back to {fallback} (next turn uses it)."
+                _log("model override removed via /model default")
+            else:
+                match = next((m["value"] for m in models or []
+                              if arg.lower() in (m.get("value", "").lower(), (m.get("displayName") or "").lower())), None)
+                if match or models is None:
+                    cfg["model"] = match or arg
+                    _save_config(cfg)
+                    reply = f"Model for {PROJECT_NAME} set to {cfg['model']} (next turn uses it)."
+                    if models is None:
+                        reply += " Couldn't check it against the model list — if the next turn fails, it doesn't exist."
+                    _log(f"model changed to {cfg['model']!r} via /model")
+                else:
+                    reply = f"Unknown model {arg!r}.\n\n{_model_list(models, current_model())}"
             self._remember_reply(envelope_id, reply)
             await self._reply(channel_id, envelope_id, reply)
             return True
