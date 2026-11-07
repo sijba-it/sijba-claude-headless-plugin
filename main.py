@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import fnmatch
 import fcntl
 import json
 import os
@@ -700,7 +701,7 @@ class PluginClient:
                     source = "claude's own default"
                 reply = f"Current model: {current_model() or 'default'} — {source}"
                 reply += "\n\n" + (_model_list(models, current_model()) if models else "(model list unavailable right now)")
-                reply += "\n\nSet with /model <name>, e.g. /model sonnet — back with /model default."
+                reply += "\n\nSet with /model <name> (e.g. /model sonnet), list with a pattern (/model claude-opus*), back with /model default."
             elif arg.lower() == "default":
                 cfg.pop("model", None)
                 _save_config(cfg)
@@ -708,10 +709,26 @@ class PluginClient:
                 reply = f"Model for {PROJECT_NAME} back to {fallback} (next turn uses it)."
                 _log("model override removed via /model default")
             else:
-                match = next((m["value"] for m in models or []
-                              if arg.lower() in (m.get("value", "").lower(), (m.get("displayName") or "").lower())), None)
-                if match or models is None:
-                    cfg["model"] = match or arg
+                pattern = any(ch in arg for ch in "*?")     # /model claude-opus* only ever lists
+                needle = arg.lower()
+                pairs = [(m.get("value", ""), " · ".join(x for x in (m.get("displayName"), m.get("description")) if x))
+                         for m in models or []]
+                if pattern:
+                    hits = [(v, d) for v, d in pairs if fnmatch.fnmatch(v.lower(), needle) or fnmatch.fnmatch(d.lower(), needle)]
+                else:
+                    hits = [(v, d) for v, d in pairs if needle in v.lower() or needle in d.lower()]
+                exact = None if pattern else next(
+                    (m["value"] for m in models or []
+                     if needle in (m.get("value", "").lower(), (m.get("displayName") or "").lower())), None)
+                if pattern and models is None:
+                    reply = "(model list unavailable right now)"
+                elif pattern and not hits:
+                    reply = f"No model matches {arg!r}.\n\n{_model_list(models, current_model())}"
+                elif pattern or (not exact and len(hits) > 1):
+                    reply = f"{len(hits)} model(s) match {arg!r} — set one with /model <name>:\n" + \
+                        "\n".join(f"  {v} — {d}" for v, d in hits)
+                elif exact or len(hits) == 1 or models is None:
+                    cfg["model"] = exact or (hits[0][0] if hits else arg)
                     _save_config(cfg)
                     reply = f"Model for {PROJECT_NAME} set to {cfg['model']} (next turn uses it)."
                     if models is None:
